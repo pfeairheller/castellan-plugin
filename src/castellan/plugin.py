@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import qasync
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QWidget
 from keri import help
@@ -23,6 +24,7 @@ from locksmith.plugins.base import (
 from locksmith.ui.vault.menu import MenuButton
 from locksmith.ui.toolkit.widgets.buttons import BackButton
 
+from .core import remoting
 from .db.basing import CastellanBaser
 
 if TYPE_CHECKING:
@@ -37,6 +39,12 @@ class CastellanPlugin(
     AccountProviderPlugin,
 ):
     """Reference Locksmith plugin for castellan platform integration."""
+
+    def __init__(self):
+        self._pages = None
+        self._db = None
+        self.parent = None
+        self._app = None
 
     @property
     def plugin_id(self) -> str:
@@ -65,6 +73,7 @@ class CastellanPlugin(
         from .schema.list import SchemaListPage
         from .credentials.issued.list import IssuedCredentialsListPage
         from .credentials.received.list import ReceivedCredentialsListPage
+        from .users.list import UsersListPage
         from .issuers.list import IdentifiersListPage
         from .issuers.multisig.initiate import InitiateMultisigPage
         from .setup import CastellanAdminSetupPage
@@ -75,6 +84,7 @@ class CastellanPlugin(
             "castellan_schema": SchemaListPage(app, None),
             "castellan_issued_credentials": IssuedCredentialsListPage(app, None),
             "castellan_received_credentials": ReceivedCredentialsListPage(app, None),
+            "castellan_users": UsersListPage(app, None),
             "castellan_issuers": IdentifiersListPage(
                 app, on_navigate_to_multisig_init=self._navigate_to_multisig_init, parent=None
             ),
@@ -166,6 +176,7 @@ class CastellanPlugin(
             (":/assets/material-icons/badge_outgoing.svg", "Issued Credentials", "castellan_issued_credentials"),
             (":/assets/material-icons/badge_incoming.svg", "Received Credentials", "castellan_received_credentials"),
             (":/assets/material-icons/schema.svg", "Schema", "castellan_schema"),
+            (":/assets/material-icons/group.svg", "Users", "castellan_users"),
             (":/assets/material-icons/group.svg", "Issuers", "castellan_issuers"),
             (":/assets/material-icons/group_add.svg", "Multi-Signature", "castellan_multisig_init"),
         ]
@@ -201,7 +212,8 @@ class CastellanPlugin(
     # PluginBase lifecycle
     # -------------------------------------------------------------------------
 
-    def on_vault_opened(self, vault: "Vault") -> None:
+    @qasync.asyncSlot()
+    async def on_vault_opened(self, vault: "Vault") -> None:
         self._db = CastellanBaser(name=vault.hby.name, reopen=True)
 
         _, settings = next(self._db.castellan_settings.getItemIter(), (None, None))  # type: ignore
@@ -213,7 +225,13 @@ class CastellanPlugin(
 
         if settings:
             self.reset_essr(vault)
+            await self.load_account(vault)
             self._start_multisig_listening(vault)
+
+    async def load_account(self, vault: "Vault"):
+        response = await remoting.get_account(self._app, vault.plugin_state["castellan"]["settings"].issuer_aid)
+        if response["success"]:
+            vault.plugin_state["castellan"]["account"] = response["account"]
 
     def on_vault_closed(self, vault: "Vault") -> None:
         self._stop_multisig_listening(vault)

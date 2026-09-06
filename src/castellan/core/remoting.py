@@ -1,8 +1,12 @@
 # -*- encoding: utf-8 -*-
 """
-castellan.core.remoting module
+Asynchronous utilities for interacting with the ESSR client and Castellan server.
 
-Functions for interacting with the Castellan credential management server.
+This module provides functionality for performing health checks, fetching and
+managing issued credentials, and interacting with the ESSR service. The methods in
+this module primarily handle asynchronous tasks such as API requests and retries.
+
+Logging is integrated to record errors and warnings during the processes.
 """
 import asyncio
 import base64
@@ -1122,5 +1126,218 @@ async def upload_account_identifier(
 
     except Exception as e:
         logger.error(f"Error uploading account identifier: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+async def get_account(app: "LocksmithApplication", account_id: str) -> Dict[str, Any]:
+    """ Load single account by account_id """
+    try:
+        essr = _get_essr(app)
+
+        path = f"/accounts/{account_id}"
+        response = await essr.request(path=path, method="GET")
+
+        if response is not None and response.status_code == 200:
+            data = response.json()
+            return {"success": True, "account": data}
+        else:
+            return {
+                'success': False,
+                'error': f"API error: {response.status_code if response else 'No response'}"
+            }
+    except Exception as e:
+        logger.error(f"Error fetching accounts: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+async def fetch_accounts(
+    app: "LocksmithApplication",
+    page: int = 0,
+    page_size: int = 10,
+    filter_term: Optional[str] = None,
+    order: Optional[list] = None,
+) -> Dict[str, Any]:
+    """Fetch user accounts from the Castellan server (paginated)."""
+    essr = _get_essr(app)
+    if not essr:
+        return {'success': False, 'error': 'No ESSR connection'}
+
+    try:
+        params = [f"page={page}", f"page_size={page_size}"]
+        if filter_term:
+            params.append(f"filter={urllib.parse.quote(filter_term)}")
+        if order:
+            for o in order:
+                params.append(f"order={urllib.parse.quote(o)}")
+
+        path = f"/accounts?{'&'.join(params)}"
+        response = await essr.request(path=path, method="GET")
+
+        if response is not None and response.status_code == 200:
+            data = response.json()
+            data['success'] = True
+            return data
+        else:
+            return {
+                'success': False,
+                'error': f"API error: {response.status_code if response else 'No response'}"
+            }
+    except Exception as e:
+        logger.error(f"Error fetching accounts: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+async def create_account(
+    app: "LocksmithApplication",
+    name: str,
+    email: str,
+    identifier_aid: str,
+    role: str,
+    first_name: Optional[str] = "",
+    last_name: Optional[str] = ""
+) -> Dict[str, Any]:
+    """Create a new user account on the Castellan server."""
+    essr = _get_essr(app)
+    if not essr:
+        return {'success': False, 'error': 'No ESSR connection'}
+
+    if not app.vault or not app.vault.hby:
+        return {'success': False, 'error': 'No local vault open'}
+
+    try:
+        hby = app.vault.hby
+
+        # Build the data part
+        data = {
+            'username': name,
+            "first_name": first_name,
+            "last_name": last_name,
+            'email': email,
+            'aid': identifier_aid,
+            'role': role.lower(),
+        }
+
+        # Get the KEL for the identifier
+        kel = bytearray()
+        for msg in hby.db.clonePreIter(pre=identifier_aid):
+            kel.extend(msg)
+
+        if not kel:
+            return {'success': False, 'error': f'No KEL data available for {identifier_aid}'}
+
+        # Create multipart form data files
+        files = {
+            'kel': ('output.bin', bytes(kel), 'application/octet-stream'),
+            'data': ('data.json', json.dumps(data), 'application/json')
+        }
+
+        response = await essr.request(
+            path="/accounts",
+            method="POST",
+            files=files,
+            timeout=60,
+        )
+
+        if response is not None and response.status_code in (200, 201):
+            result = response.json() if response.content else {}
+            return {'success': True, 'data': result}
+        else:
+            if response is not None:
+                logger.error(f"Create account failed with status {response.status_code}: {response.text}")
+                try:
+                    error_msg = response.json().get('description', f"Status {response.status_code}")
+                except Exception:
+                    error_msg = f"Status {response.status_code}"
+            else:
+                error_msg = "No response"
+            return {'success': False, 'error': error_msg}
+
+    except Exception as e:
+        logger.error(f"Error creating account: {e}")
+        return {'success': False, 'error': str(e)}
+
+async def delete_account(
+    app: "LocksmithApplication",
+    account_id: str,
+) -> Dict[str, Any]:
+    """Delete a user account from the Castellan server."""
+    essr = _get_essr(app)
+    if not essr:
+        return {'success': False, 'error': 'No ESSR connection'}
+
+    try:
+        response = await essr.request(
+            path=f"/accounts/{urllib.parse.quote(account_id, safe='')}",
+            method="DELETE",
+        )
+
+        if response is not None and response.status_code == 204:
+            return {'success': True}
+        else:
+            return {
+                'success': False,
+                'error': f"API error: {response.status_code if response else 'No response'}"
+            }
+    except Exception as e:
+        logger.error(f"Error deleting account: {e}")
+        return {'success': False, 'error': str(e)}
+
+async def update_account(
+        app: "LocksmithApplication",
+        account_id: str,
+        username: Optional[str] = None,
+        email: Optional[str] = None,
+        role: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Update a user account on the Castellan server."""
+    essr = _get_essr(app)
+    if not essr:
+        return {'success': False, 'error': 'No ESSR connection'}
+
+    try:
+        # Build update body with only provided fields
+        body = {}
+        if username is not None:
+            body['username'] = username
+        if email is not None:
+            body['email'] = email
+        if role is not None:
+            body['role'] = role.lower()
+        if first_name is not None:
+            body['first_name'] = first_name
+        if last_name is not None:
+            body['last_name'] = last_name
+
+        if not body:
+            return {'success': False, 'error': 'No fields to update'}
+
+        response = await essr.request(
+            path=f"/accounts/{urllib.parse.quote(account_id, safe='')}",
+            method="POST",
+            json=body,
+            timeout=30,
+        )
+
+        if response is not None and response.status_code in (200, 204):
+            data = response.json() if response.content else {}
+            return {'success': True, 'data': data}
+        else:
+            if response is not None:
+                logger.error(f"Update account failed with status {response.status_code}: {response.text}")
+                try:
+                    error_msg = response.json().get('description', f"Status {response.status_code}")
+                except Exception:
+                    error_msg = f"Status {response.status_code}"
+            else:
+                error_msg = "No response"
+            return {'success': False, 'error': error_msg}
+
+    except Exception as e:
+        logger.error(f"Error updating account: {e}")
         return {'success': False, 'error': str(e)}
 
